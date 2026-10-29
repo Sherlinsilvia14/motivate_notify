@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+execution.log
+
+# Local secrets & personal configuration
+config.json
+.env
