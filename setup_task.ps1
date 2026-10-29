@@ -5,7 +5,7 @@ $scriptPath = "$PSScriptRoot\send_bible_quote.py"
 
 Write-Host "Registering Windows Scheduled Task '$taskName' to run daily at 7:00 AM and 10:00 PM..." -ForegroundColor Cyan
 
-# Remove old task if exists
+# Remove old tasks if exist
 Unregister-ScheduledTask -TaskName "DailyBibleQuote7AM" -Confirm:$false -ErrorAction SilentlyContinue
 Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
 
@@ -15,9 +15,9 @@ $action = New-ScheduledTaskAction -Execute $pythonPath -Argument "`"$scriptPath`
 $triggerMorning = New-ScheduledTaskTrigger -Daily -At 7:00AM
 $triggerNight = New-ScheduledTaskTrigger -Daily -At 10:00PM
 
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -WakeToRun -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
 
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($triggerMorning, $triggerNight) -Settings $settings -Force
 
 Write-Host "Task '$taskName' successfully registered!" -ForegroundColor Green
-Write-Host "Triggers: Every day at 7:00 AM and 10:00 PM (sharp)" -ForegroundColor Green
+Write-Host "Triggers: Every day at 7:00 AM and 10:00 PM (sharp) with WakeToRun enabled" -ForegroundColor Green

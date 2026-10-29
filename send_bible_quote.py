@@ -1,22 +1,66 @@
 import json
 import os
+import socket
 import sys
+import time
+import traceback
 import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-# Ensure UTF-8 output on Windows consoles
-if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
+# Enforce global network timeout of 15 seconds so requests never hang indefinitely
+socket.setdefaulttimeout(15)
+
+# Ensure UTF-8 output if console exists
+if sys.stdout and hasattr(sys.stdout, 'encoding') and sys.stdout.encoding:
+    if sys.stdout.encoding.lower() != 'utf-8':
+        try:
+            sys.stdout.reconfigure(encoding='utf-8')
+        except Exception:
+            pass
+
+SCRIPT_DIR = Path(__file__).parent.resolve()
+CONFIG_FILE = SCRIPT_DIR / "config.json"
+LOG_FILE = SCRIPT_DIR / "execution.log"
+CRASH_LOG = SCRIPT_DIR / "crash.log"
+
+NTFY_TOPIC = "daily-bible-quotes"
+
+def log(msg: str):
+    """Safe logger that guarantees writing to log file even if stdout fails."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    formatted = f"[{timestamp}] {msg}"
+    
+    # Safe console print (fails silently in headless background tasks)
     try:
-        sys.stdout.reconfigure(encoding='utf-8')
+        if sys.stdout:
+            print(formatted)
     except Exception:
         pass
 
-CONFIG_FILE = Path(__file__).parent / "config.json"
-LOG_FILE = Path(__file__).parent / "execution.log"
+    # Guaranteed file log
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(formatted + "\n")
+            f.flush()
+    except Exception:
+        pass
 
-NTFY_TOPIC = "daily-bible-quotes"
+def handle_exception(exc_type, exc_value, exc_traceback):
+    """Global crash handler to log uncaught exceptions."""
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    error_msg = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+    log(f"CRITICAL UNCAUGHT EXCEPTION:\n{error_msg}")
+    try:
+        with open(CRASH_LOG, "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {error_msg}\n")
+    except Exception:
+        pass
+
+sys.excepthook = handle_exception
 
 MORNING_VERSES = [
     {
@@ -80,19 +124,6 @@ EVENING_VERSES = [
     }
 ]
 
-def log(msg: str):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    formatted = f"[{timestamp}] {msg}"
-    try:
-        print(formatted)
-    except UnicodeEncodeError:
-        print(formatted.encode("ascii", errors="replace").decode("ascii"))
-    try:
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(formatted + "\n")
-    except Exception:
-        pass
-
 def load_config() -> dict:
     if CONFIG_FILE.exists():
         try:
@@ -107,7 +138,6 @@ def fetch_verse(is_morning: bool) -> tuple[str, str]:
     day_of_year = datetime.now().timetuple().tm_yday
     verse_pool = MORNING_VERSES if is_morning else EVENING_VERSES
 
-    # If morning, try NET Bible verse of the day
     if is_morning:
         try:
             req = urllib.request.Request(
@@ -128,31 +158,37 @@ def fetch_verse(is_morning: bool) -> tuple[str, str]:
         except Exception as e:
             log(f"Online API notice ({e}), using curated morning scripture.")
 
-    # Select from contextual verse pool based on day index
     idx = day_of_year % len(verse_pool)
     item = verse_pool[idx]
     return item["text"], item["reference"]
 
 def send_ntfy_notification(topic: str, title: str, message: str, tags: str) -> bool:
-    """Send instant push notification to phone via ntfy."""
+    """Send instant push notification to phone via ntfy with automatic retries."""
     url = f"https://ntfy.sh/{topic}"
-    try:
-        req = urllib.request.Request(
-            url,
-            data=message.encode("utf-8"),
-            headers={
-                "Title": urllib.parse.quote(title),
-                "Priority": "default",
-                "Tags": tags
-            },
-            method="POST"
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            log(f"ntfy push notification sent successfully (status {resp.status})")
-            return True
-    except Exception as e:
-        log(f"Failed to send ntfy notification: {e}")
-        return False
+    
+    # Retry up to 3 times in case network/Wi-Fi is waking up
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            req = urllib.request.Request(
+                url,
+                data=message.encode("utf-8"),
+                headers={
+                    "Title": urllib.parse.quote(title),
+                    "Priority": "default",
+                    "Tags": tags
+                },
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                log(f"ntfy push notification sent successfully (status {resp.status})")
+                return True
+        except Exception as e:
+            log(f"Attempt {attempt}/{max_retries} failed to send ntfy notification: {e}")
+            if attempt < max_retries:
+                time.sleep(5)  # Wait 5 seconds for Wi-Fi to stabilize before retrying
+                
+    return False
 
 def send_callmebot_whatsapp(phone: str, message: str, apikey: str) -> bool:
     """Optionally send WhatsApp if API key is provided."""
@@ -171,69 +207,73 @@ def send_callmebot_whatsapp(phone: str, message: str, apikey: str) -> bool:
         return False
 
 def main():
-    config = load_config()
-    topic = config.get("ntfy_topic", NTFY_TOPIC)
-    phone = config.get("phone", "")
-    apikey = config.get("callmebot_apikey")
+    try:
+        config = load_config()
+        topic = config.get("ntfy_topic", NTFY_TOPIC)
+        phone = config.get("phone", "")
+        apikey = config.get("callmebot_apikey")
 
-    now = datetime.now()
-    current_hour = now.hour
+        now = datetime.now()
+        current_hour = now.hour
 
-    # Morning if before 12:00 PM, otherwise Evening / Night
-    is_morning = current_hour < 12
+        # Morning if before 12:00 PM, otherwise Evening / Night
+        is_morning = current_hour < 12
 
-    time_label = "Morning" if is_morning else "Evening"
-    log(f"Fetching Daily {time_label} Bible Quote (Hour: {current_hour})...")
+        time_label = "Morning" if is_morning else "Evening"
+        log(f"Fetching Daily {time_label} Bible Quote (Hour: {current_hour})...")
 
-    verse_text, reference = fetch_verse(is_morning=is_morning)
+        verse_text, reference = fetch_verse(is_morning=is_morning)
+        today_str = now.strftime("%A, %d %B %Y")
 
-    today_str = now.strftime("%A, %d %B %Y")
+        if is_morning:
+            title = f"Morning Bible Verse - {reference}"
+            tags = "sunrise,pray,book"
+            notification_body = (
+                f"\"{verse_text}\"\n\n"
+                f"— {reference}\n\n"
+                f"Have a blessed and joyful day ahead! 🙏✨"
+            )
+            whatsapp_msg = (
+                f"🌅 *Good Morning! Daily Bible Quote*\n"
+                f"📅 {today_str}\n\n"
+                f"\"{verse_text}\"\n\n"
+                f"— *{reference}*\n\n"
+                f"✨ Have a blessed and joyful day ahead! 🙏"
+            )
+        else:
+            title = f"Night Bible Verse - {reference}"
+            tags = "crescent_moon,pray,bed"
+            notification_body = (
+                f"\"{verse_text}\"\n\n"
+                f"— {reference}\n\n"
+                f"Rest peacefully in God's peace and grace tonight! 😴🙏"
+            )
+            whatsapp_msg = (
+                f"🌙 *Good Night! Evening Bible Quote*\n"
+                f"📅 {today_str}\n\n"
+                f"\"{verse_text}\"\n\n"
+                f"— *{reference}*\n\n"
+                f"😴 Rest peacefully in God's peace and grace tonight! 🙏"
+            )
 
-    if is_morning:
-        title = f"Morning Bible Verse - {reference}"
-        tags = "sunrise,pray,book"
-        notification_body = (
-            f"\"{verse_text}\"\n\n"
-            f"— {reference}\n\n"
-            f"Have a blessed and joyful day ahead! 🙏✨"
-        )
-        whatsapp_msg = (
-            f"🌅 *Good Morning! Daily Bible Quote*\n"
-            f"📅 {today_str}\n\n"
-            f"\"{verse_text}\"\n\n"
-            f"— *{reference}*\n\n"
-            f"✨ Have a blessed and joyful day ahead! 🙏"
-        )
-    else:
-        title = f"Night Bible Verse - {reference}"
-        tags = "crescent_moon,pray,bed"
-        notification_body = (
-            f"\"{verse_text}\"\n\n"
-            f"— {reference}\n\n"
-            f"Rest peacefully in God's peace and grace tonight! 😴🙏"
-        )
-        whatsapp_msg = (
-            f"🌙 *Good Night! Evening Bible Quote*\n"
-            f"📅 {today_str}\n\n"
-            f"\"{verse_text}\"\n\n"
-            f"— *{reference}*\n\n"
-            f"😴 Rest peacefully in God's peace and grace tonight! 🙏"
-        )
+        log(f"Sending Verse: {reference} [{title}] to topic '{topic}'")
 
-    log(f"Sending Verse: {reference} [{title}]")
+        # Primary delivery: ntfy push notification to phone
+        success = send_ntfy_notification(topic=topic, title=title, message=notification_body, tags=tags)
 
-    # Primary delivery: ntfy push notification to phone
-    success = send_ntfy_notification(topic=topic, title=title, message=notification_body, tags=tags)
+        # Secondary delivery: if CallMeBot API key is configured, also send via WhatsApp
+        if apikey and apikey != "YOUR_API_KEY_HERE":
+            log("Attempting WhatsApp delivery as well...")
+            send_callmebot_whatsapp(phone=phone, message=whatsapp_msg, apikey=apikey)
 
-    # Secondary delivery: if CallMeBot API key is configured, also send via WhatsApp
-    if apikey and apikey != "YOUR_API_KEY_HERE":
-        log("Attempting WhatsApp delivery as well...")
-        send_callmebot_whatsapp(phone=phone, message=whatsapp_msg, apikey=apikey)
+        if success:
+            log(f"SUCCESS: Daily {time_label} Bible Quote successfully delivered to phone!")
+        else:
+            log("ERROR: Failed to deliver notification after retries.")
+            sys.exit(1)
 
-    if success:
-        log(f"SUCCESS: Daily {time_label} Bible Quote successfully delivered to phone!")
-    else:
-        log("ERROR: Failed to deliver notification.")
+    except Exception as e:
+        log(f"FATAL ERROR in main: {e}\n{traceback.format_exc()}")
         sys.exit(1)
 
 if __name__ == "__main__":
